@@ -232,6 +232,26 @@ python run_benchmark.py \
     --continue_from_last_run_path "results/GameOf24/openai_gpt-4o-mini_DynamicCheatsheet_Cumulative_2025-01-01-12-00_.jsonl"
 ```
 
+## Memory-Scaling Experiment (Verifiable Rewards)
+
+`run_memory_scaling.py` measures how held-out accuracy changes as more training data is fed into the memory:
+
+1. Each dataset (`gsm8k`, `math500`, `aime`) is split into a held-out test set and a train set (seeded, identical across models; defaults: 250/150 for GSM8K and MATH500, 83/50 for AIME 2020-2024).
+2. The test set is evaluated with an empty cheatsheet (checkpoint 0%).
+3. The train set is fed to DC-Cumulative in 5 chunks of 20%. For each training problem, the answer is verified against the ground truth (`dynamic_cheatsheet/utils/math_grader.py`, exact numeric match + `math_verify` symbolic equivalence), and the curator (`prompts/curator_prompt_verifiable.txt`) updates the cheatsheet given the verdict and the gold answer (`--feedback gold`; `binary` gives only the verdict, `none` is the original self-assessed DC curator).
+4. After each chunk, the cheatsheet is frozen and the full test set is re-evaluated.
+
+```bash
+# config.env: SWISSAI_API_KEY=...
+python run_memory_scaling.py --dataset math500 --model_name "swissai/SwissAI-Research/Qwen/Qwen3-8B"
+bash scripts/run_memory_scaling_all.sh   # all datasets x {Qwen2.5-7B-Instruct, Qwen3-8B}, in parallel
+python plot_memory_scaling.py            # table + figure of test accuracy vs. % train data
+```
+
+Outputs go to `results/memory_scaling/<dataset>/<run>/`: `train_log.jsonl` (per-example generator/curator outputs and cheatsheet), `cheatsheets/ckpt*.txt`, `test_ckpt*.jsonl`, and `summary.json`. Re-running the same command resumes an interrupted run. Qwen3 runs with thinking disabled unless `--enable_thinking` is passed.
+
+`--memory_mode append` replaces the rewritten cheatsheet with an append-only memory (`dynamic_cheatsheet/append_memory.py`, curator prompt `prompts/curator_prompt_append.txt`): the curator writes 1-3 new memory items per training problem, and each question is shown the top-k most similar items (`--retrieve_top_k`, default 5) retrieved with `Qwen3-Embedding-8B`. Memory snapshots per checkpoint are saved under `memory/`. `plot_memory_scaling.py --exclude <substring>` leaves runs out of the figure.
+
 ### Example Notebook
 
 For an interactive demonstration, see `ExampleUsage.ipynb`.

@@ -28,6 +28,7 @@ _PROVIDER_MAP = {
     "together": "openai",
     "deepseek": "openai",
     "ollama": "openai",
+    "swissai": "openai",
 }
 
 # Configuration for OpenAI-compatible providers
@@ -36,6 +37,7 @@ _OPENAI_COMPATIBLE = {
     "together": {"base_url": "https://api.together.xyz/v1", "api_key_env": "TOGETHER_API_KEY"},
     "deepseek": {"base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY"},
     "ollama": {"base_url": "http://localhost:11434/v1", "api_key_env": None},
+    "swissai": {"base_url": "https://api.swissai.svc.cscs.ch/v1", "api_key_env": "SWISSAI_API_KEY"},
 }
 
 # All supported approach names
@@ -154,6 +156,9 @@ class LanguageModel:
     # without requiring a container (e.g. Claude's code_execution tool).
     _NATIVE_CODE_EXECUTION_ID = "native"
 
+    # Code execution output longer than this is truncated before it is fed back to the model
+    MAX_CODE_OUTPUT_CHARS = 8000
+
     def create_container(self, **kwargs) -> str:
         """
         Create a code interpreter session and return an identifier.
@@ -255,6 +260,10 @@ class LanguageModel:
                 executed_code = extract_and_run_python_code(output_prefix)
                 if executed_code:
                     executed_code = executed_code.strip()
+                    # Huge prints (e.g. a loop dumping candidates) can overflow the context window on the next round
+                    if len(executed_code) > self.MAX_CODE_OUTPUT_CHARS:
+                        head, tail = executed_code[:6000], executed_code[-2000:]
+                        executed_code = f"{head}\n... [{len(executed_code) - 8000} characters of output truncated] ...\n{tail}"
                 else:
                     executed_code = "(No code block found to execute)"
                 current_output = f"{output_prefix}\n{code_execution_flag}\n\n{executed_code}"
