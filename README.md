@@ -252,6 +252,8 @@ Outputs go to `results/memory_scaling/<dataset>/<run>/`: `train_log.jsonl` (per-
 
 `--memory_mode append` replaces the rewritten cheatsheet with an append-only memory (`dynamic_cheatsheet/append_memory.py`, curator prompt `prompts/curator_prompt_append.txt`): the curator writes 1-3 new memory items per training problem, and each question is shown the top-k most similar items (`--retrieve_top_k`, default 5) retrieved with `Qwen3-Embedding-8B`. Memory snapshots per checkpoint are saved under `memory/`. `plot_memory_scaling.py --exclude <substring>` leaves runs out of the figure.
 
+Transfer mode trains the memory on one dataset and tests on the held-out splits of others, e.g. `--dataset deepscaler --test_datasets gsm8k math500 aime` (DeepScaleR-Preview, 250 problems by default). The test problems are the same as in the in-domain runs, and DeepScaleR problems sharing a 13-word n-gram with any GSM8K, MATH500 or AIME problem are removed before sampling. `summary.json` reports accuracy per test dataset; `plot_memory_scaling.py --results_directory results/memory_scaling results/deepscaler_transfer` draws the transfer runs as dotted lines next to the in-domain runs.
+
 ### Example Notebook
 
 For an interactive demonstration, see `ExampleUsage.ipynb`.

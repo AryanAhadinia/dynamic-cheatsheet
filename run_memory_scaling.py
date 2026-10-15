@@ -15,6 +15,10 @@ Memory modes:
     Each question sees the top-k most similar items (embedding retrieval), so later memories are
     supersets of earlier ones while the generator's context stays a fixed size.
 
+Transfer mode (--test_datasets): train on one dataset (e.g. DeepScaleR) and evaluate on the held-out
+test splits of other datasets (the same test problems as their in-domain runs). Training problems that
+overlap any problem of the test datasets are removed first.
+
 All intermediate state is written to disk, so re-running the same command resumes where it stopped.
 """
 
@@ -22,9 +26,12 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from typing import List
 
 import numpy as np
 from datasets import load_dataset, load_from_disk
@@ -39,6 +46,7 @@ from dynamic_cheatsheet.utils.math_grader import extract_math_answer, grade_math
 FORMAT_INSTRUCTIONS = {
     "gsm8k": "(Please provide your final answer as a single number, with no units, currency symbols, or additional text.)",
     "math500": "(Please provide your final answer as a simplified exact expression in LaTeX, e.g., \\frac{3}{4} or 2\\sqrt{5}, with no additional text.)",
+    "deepscaler": "(Please provide your final answer as a simplified exact expression in LaTeX, e.g., \\frac{3}{4} or 2\\sqrt{5}, with no additional text.)",
     "aime": "(Please provide your answer in the form of an integer, e.g., 1234, with no Markdown formatting or additional text; make sure to pay attention to the desired format of the final answer though.)",
 }
 
@@ -47,12 +55,16 @@ DEFAULT_SPLIT_SIZES = {
     "gsm8k": (250, 150),
     "math500": (250, 150),
     "aime": (-1, 50),
+    "deepscaler": (250, 0),  # Only used as a training set (transfer mode)
 }
 
 CURATOR_FORMAT_REMINDER = (
     "Your response did not contain the cheatsheet in the required format. Output the complete new cheatsheet now, "
     "wrapped exactly as:\n\nNEW CHEATSHEET:\n```\n<cheatsheet>\n...\n</cheatsheet>\n```"
 )
+
+# Word n-gram length for train/test decontamination (as in GPT-3's contamination analysis)
+DECONTAMINATION_NGRAM = 13
 
 GENERATION_OVERFLOW = "(Generation stopped: the conversation exceeded the model's context window.)"
 
@@ -100,6 +112,10 @@ class Arguments(Tap):
     save_directory: str = "results/memory_scaling"
     run_tag: str = ""  # Optional suffix for the run directory
 
+    # Transfer mode: train on all of --dataset (decontaminated, n_train sampled) and evaluate on the
+    # held-out test splits of these datasets, e.g. --dataset deepscaler --test_datasets gsm8k math500 aime
+    test_datasets: List[str] = []
+
 
 def read_file(path: str) -> str:
     with open(path, "r") as f:
@@ -132,6 +148,9 @@ def load_math_dataset(name: str) -> list:
             {"id": ex["unique_id"], "question": ex["problem"], "answer": ex["answer"], "subject": ex["subject"], "level": ex["level"]}
             for ex in data
         ]
+    elif name == "deepscaler":
+        data = load_dataset("agentica-org/DeepScaleR-Preview-Dataset", split="train")
+        return [{"id": f"deepscaler-{i}", "question": ex["problem"], "answer": ex["answer"]} for i, ex in enumerate(data)]
     elif name == "aime":
         data = load_from_disk("data/AIME_2020_2024")
         return [
@@ -155,8 +174,35 @@ def make_split(examples: list, n_train: int, n_test: int, seed: int):
     return train, test
 
 
-def format_question(args: Arguments, question: str, label: str) -> str:
-    return f"Question{label}:\n{question} {FORMAT_INSTRUCTIONS[args.dataset]}"
+def format_question(args: Arguments, question: str, label: str, source: str = None) -> str:
+    return f"Question{label}:\n{question} {FORMAT_INSTRUCTIONS[source or args.dataset]}"
+
+
+def _ngrams(text: str, n: int) -> set:
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    if len(words) < n:
+        return {" ".join(words)}
+    return {" ".join(words[i:i + n]) for i in range(len(words) - n + 1)}
+
+
+def make_transfer_split(args: Arguments):
+    """Decontaminated train sample from args.dataset; test = the in-domain held-out splits of args.test_datasets."""
+    test, banned = [], set()
+    for name in args.test_datasets:
+        examples = load_math_dataset(name)
+        n_train, n_test = DEFAULT_SPLIT_SIZES[name]
+        test += [{**ex, "source": name} for ex in make_split(examples, n_train, n_test, args.seed)[1]]
+        # Decontaminate against every problem of the test dataset, not only its test split
+        for ex in examples:
+            banned |= _ngrams(ex["question"], DECONTAMINATION_NGRAM)
+    candidates = load_math_dataset(args.dataset)
+    clean = [ex for ex in candidates if not (_ngrams(ex["question"], DECONTAMINATION_NGRAM) & banned)]
+    print(f"Decontamination: removed {len(candidates) - len(clean)}/{len(candidates)} {args.dataset} problems "
+          f"sharing a {DECONTAMINATION_NGRAM}-gram with {', '.join(args.test_datasets)}")
+    random.Random(args.seed).shuffle(clean)
+    if args.n_train > len(clean):
+        raise ValueError(f"Requested n_train={args.n_train} but only {len(clean)} clean examples are available.")
+    return clean[:args.n_train], test
 
 
 def is_context_overflow(error: Exception) -> bool:
@@ -288,7 +334,7 @@ def evaluate_test(model: LanguageModel, args: Arguments, test: list, contexts: d
         failures = 0
         with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
             futures = {
-                executor.submit(solve, model, args, format_question(args, ex["question"], ""), contexts[ex["id"]][0]): ex
+                executor.submit(solve, model, args, format_question(args, ex["question"], "", ex.get("source")), contexts[ex["id"]][0]): ex
                 for ex in todo
             }
             # Grading happens here, in the main thread (math_verify relies on SIGALRM)
@@ -304,6 +350,7 @@ def evaluate_test(model: LanguageModel, args: Arguments, test: list, contexts: d
                 append_jsonl(path, {
                     "id": ex["id"],
                     "gold": ex["answer"],
+                    "source": ex.get("source", args.dataset),
                     "prediction": prediction,
                     "correct": grade_math_answer(prediction, ex["answer"]),
                     "retrieved": contexts[ex["id"]][1],
@@ -354,7 +401,8 @@ def main(args: Arguments):
     model_slug = args.model_name.split("/")[-1]
     thinking_tag = ("_thinking" if args.enable_thinking else "_nothinking") if is_qwen3 else ""
     memory_tag = f"_append-k{args.retrieve_top_k}" if args.memory_mode == "append" else ""
-    run_name = f"{model_slug}{thinking_tag}{memory_tag}_feedback-{args.feedback}_seed{args.seed}{args.run_tag}"
+    transfer_tag = f"_test-{'+'.join(args.test_datasets)}" if args.test_datasets else ""
+    run_name = f"{model_slug}{thinking_tag}{memory_tag}{transfer_tag}_feedback-{args.feedback}_seed{args.seed}{args.run_tag}"
     run_dir = os.path.join(args.save_directory, args.dataset, run_name)
     snapshot_dir = os.path.join(run_dir, "memory" if args.memory_mode == "append" else "cheatsheets")
     os.makedirs(snapshot_dir, exist_ok=True)
@@ -365,9 +413,10 @@ def main(args: Arguments):
         previous = json.load(open(config_path))
         keys = ["dataset", "n_train", "n_test", "n_chunks", "seed", "feedback", "max_tokens",
                 "temperature", "execute_python_code", "enable_thinking", "generator_prompt_path", "curator_prompt_path",
-                "memory_mode", "retrieve_top_k", "embedding_model"]
+                "memory_mode", "retrieve_top_k", "embedding_model", "test_datasets"]
         # Runs created before a key existed used its default value
-        legacy_defaults = {"memory_mode": "rewrite", "retrieve_top_k": config["retrieve_top_k"], "embedding_model": config["embedding_model"]}
+        legacy_defaults = {"memory_mode": "rewrite", "retrieve_top_k": config["retrieve_top_k"],
+                           "embedding_model": config["embedding_model"], "test_datasets": []}
         for key in keys:
             if previous.get(key, legacy_defaults.get(key)) != config.get(key):
                 raise ValueError(f"Run dir {run_dir} was created with {key}={previous.get(key)!r}, not {config.get(key)!r}.")
@@ -382,7 +431,10 @@ def main(args: Arguments):
         json.dump(config, open(config_path, "w"), indent=2)
 
     # Split (deterministic given dataset + seed, so all models share the same test set)
-    train, test = make_split(load_math_dataset(args.dataset), args.n_train, args.n_test, args.seed)
+    if args.test_datasets:
+        train, test = make_transfer_split(args)
+    else:
+        train, test = make_split(load_math_dataset(args.dataset), args.n_train, args.n_test, args.seed)
     json.dump({"train_ids": [ex["id"] for ex in train], "test_ids": [ex["id"] for ex in test]},
               open(os.path.join(run_dir, "split.json"), "w"), indent=2)
     if memory is not None:
@@ -442,9 +494,21 @@ def main(args: Arguments):
             "memory_items": len(items) if items is not None else None,
             "mean_context_words": float(np.mean([len(c.split()) for c, _ in contexts.values()])),
         })
+        if args.test_datasets:
+            summary[-1]["per_test_dataset"] = {
+                name: {
+                    "test_accuracy": float(np.mean([r["correct"] for r in rows if r["source"] == name])),
+                    "test_correct": int(sum(r["correct"] for r in rows if r["source"] == name)),
+                    "n_test": sum(r["source"] == name for r in rows),
+                    "test_no_answer": int(sum(r["prediction"] == NO_ANSWER for r in rows if r["source"] == name)),
+                }
+                for name in args.test_datasets
+            }
         json.dump(summary, open(os.path.join(run_dir, "summary.json"), "w"), indent=2)
         print(f"== Checkpoint {k} test accuracy: {summary[-1]['test_accuracy']:.3f} "
               f"({summary[-1]['test_correct']}/{summary[-1]['n_test']}, no answer: {summary[-1]['test_no_answer']})")
+        for name, s in summary[-1].get("per_test_dataset", {}).items():
+            print(f"     {name}: {s['test_accuracy']:.3f} ({s['test_correct']}/{s['n_test']})")
 
     print("\nTest accuracy vs. training data seen:")
     for s in summary:

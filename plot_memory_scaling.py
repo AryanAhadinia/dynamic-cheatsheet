@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+from typing import List
 
 import pandas as pd
 import matplotlib
@@ -27,7 +28,7 @@ DATASET_TITLES = {"gsm8k": "GSM8K", "math500": "MATH500", "aime": "AIME 2020-202
 
 
 class Arguments(Tap):
-    results_directory: str = "results/memory_scaling"
+    results_directory: List[str] = ["results/memory_scaling"]  # One or more results roots (e.g. in-domain + transfer)
     output_path: str = "results/memory_scaling/memory_scaling.png"
     exclude: list = []  # Leave runs out of the figure (not the CSV) if their name contains any of these strings
 
@@ -43,18 +44,31 @@ def wilson_interval(correct: int, n: int, z: float = 1.96):
     return center - half, center + half
 
 
-def load_runs(results_directory: str) -> pd.DataFrame:
+def load_runs(results_directories: List[str]) -> pd.DataFrame:
     rows = []
-    for path in sorted(glob.glob(os.path.join(results_directory, "*", "*", "summary.json"))):
+    paths = [p for d in results_directories for p in sorted(glob.glob(os.path.join(d, "*", "*", "summary.json")))]
+    for path in paths:
         dataset, run = path.split(os.sep)[-3:-1]
         for s in json.load(open(path)):
-            low, high = wilson_interval(s["test_correct"], s["n_test"])
-            rows.append({"dataset": dataset, "run": run, **s, "ci_low": low, "ci_high": high})
+            # Transfer runs (trained on one dataset, tested on several) become one row per test dataset
+            per_test = s.pop("per_test_dataset", None)
+            targets = per_test.items() if per_test else [(dataset, {})]
+            for test_dataset, scores in targets:
+                row = {"dataset": test_dataset, "run": f"{run}@train-{dataset}" if per_test else run, **s, **scores}
+                row["ci_low"], row["ci_high"] = wilson_interval(row["test_correct"], row["n_test"])
+                rows.append(row)
     return pd.DataFrame(rows)
 
 
 def describe_run(run: str):
     """Split a run directory name into (model label, memory label)."""
+    run, _, train_dataset = run.partition("@train-")
+    model, memory = _describe_in_domain_run(run)
+    return model, memory + (f", trained on {train_dataset}" if train_dataset else "")
+
+
+def _describe_in_domain_run(run: str):
+    run = re.sub(r"_test-[\w+]+?(?=_feedback)", "", run)
     model = re.split(r"_append-k-?\d+|_feedback", run)[0]
     match = re.search(r"_append-k(-?\d+)", run)
     memory = ("append, all items" if match.group(1) == "-1" else f"append, top-{match.group(1)}") if match else "rewrite (DC-Cumulative)"
@@ -74,7 +88,8 @@ def plot(df: pd.DataFrame, output_path: str) -> None:
     models = sorted({describe_run(run)[0] for run in runs})
     model_colors = {m: SERIES_COLORS[i % len(SERIES_COLORS)] for i, m in enumerate(models)}
     colors = {run: model_colors[describe_run(run)[0]] for run in runs}
-    styles = {run: "-" if describe_run(run)[1].startswith("append") else "--" for run in runs}
+    # Solid = append (in-domain), dashed = rewrite, dotted = trained on another dataset (transfer)
+    styles = {run: ":" if "@train-" in run else "-" if describe_run(run)[1].startswith("append") else "--" for run in runs}
 
     fig, axes = plt.subplots(1, len(datasets), figsize=(4.6 * len(datasets), 4.0), squeeze=False, facecolor=SURFACE)
     for ax, dataset in zip(axes[0], datasets):
@@ -101,8 +116,9 @@ def plot(df: pd.DataFrame, output_path: str) -> None:
             for label, y in zip(group, positions):
                 ax.text(x + 2.5, y - shift, label[2], va="center", fontsize=8, color=TEXT_SECONDARY)
         n_test = int(sub["n_test"].max())
-        n_train = int(sub["n_train_seen"].max())
-        ax.set_title(f"{DATASET_TITLES.get(dataset, dataset)}  (train {n_train}, test {n_test})", fontsize=10, color=TEXT_PRIMARY, loc="left")
+        n_train = sorted({int(n) for n in sub.groupby("run")["n_train_seen"].max()})
+        train_label = f"train {n_train[0]}, " if len(n_train) == 1 else ""
+        ax.set_title(f"{DATASET_TITLES.get(dataset, dataset)}  ({train_label}test {n_test})", fontsize=10, color=TEXT_PRIMARY, loc="left")
         ax.set_xlabel("Training data fed to memory (%)", fontsize=9, color=TEXT_SECONDARY)
         ax.set_xticks(sorted(sub["train_pct"].unique()))
         ax.set_xlim(-5, 112)

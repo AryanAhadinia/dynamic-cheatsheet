@@ -44,7 +44,8 @@ class Embedder:
     def __init__(self, model: str, base_url: str = "https://api.swissai.svc.cscs.ch/v1",
                  api_key_env: str = "SWISSAI_API_KEY", batch_size: int = 64, max_chars: int = 8000) -> None:
         self.model = model
-        self.client = OpenAI(base_url=base_url, api_key=os.environ[api_key_env])
+        # Fail fast on a hung request (the SDK default is 10 min x 3 attempts); _request retries itself
+        self.client = OpenAI(base_url=base_url, api_key=os.environ[api_key_env], timeout=60, max_retries=0)
         self.batch_size = batch_size
         self.max_chars = max_chars
         self.cache: Dict[str, np.ndarray] = {}
